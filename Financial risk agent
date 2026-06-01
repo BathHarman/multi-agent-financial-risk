@@ -1,0 +1,405 @@
+"""
+Multi-Agent LLM Framework for Financial Risk Assessment
+Uses AutoGen with a Commander → Financial Analyst → Risk Safeguard pipeline.
+
+Compares multi-agent (with Safeguard validation) vs single-agent reliability
+on volatility and Value-at-Risk calculations.
+
+Author: Harman Bath
+"""
+
+import os
+import json
+import time
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import autogen
+from datetime import datetime, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+RESULTS_DIR = Path("./results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise EnvironmentError(
+        "OPENAI_API_KEY not found. Add it to a .env file:\n  OPENAI_API_KEY=sk-..."
+    )
+
+LLM_CONFIG = {
+    "config_list": [{"model": "gpt-4", "api_key": OPENAI_API_KEY}],
+    "temperature": 0,        # deterministic for financial calculations
+    "timeout": 120,
+}
+
+# Default portfolio for demo — can be overridden via CLI or import
+DEFAULT_PORTFOLIO = {
+    "AAPL": 0.30,
+    "MSFT": 0.25,
+    "JNJ":  0.20,
+    "JPM":  0.15,
+    "XOM":  0.10,
+}
+
+LOOKBACK_DAYS = 252    # 1 trading year
+VAR_CONFIDENCE = 0.95  # 95% VaR
+
+
+# ─────────────────────────────────────────────
+# STEP 1: FETCH MARKET DATA
+# ─────────────────────────────────────────────
+def fetch_portfolio_data(portfolio: dict[str, float]) -> pd.DataFrame:
+    """
+    Download adjusted close prices for all tickers in the portfolio.
+    Returns a DataFrame of daily log returns.
+    """
+    end   = datetime.today()
+    start = end - timedelta(days=LOOKBACK_DAYS + 30)   # buffer for weekends/holidays
+
+    tickers = list(portfolio.keys())
+    print(f"Fetching data for: {', '.join(tickers)}")
+
+    raw = yf.download(tickers, start=start.strftime("%Y-%m-%d"),
+                      end=end.strftime("%Y-%m-%d"), auto_adjust=True,
+                      progress=False)["Close"]
+
+    # Drop rows with any missing values, keep last LOOKBACK_DAYS trading days
+    raw = raw.dropna().iloc[-LOOKBACK_DAYS:]
+    returns = np.log(raw / raw.shift(1)).dropna()
+
+    print(f"  {len(returns)} trading days loaded ({returns.index[0].date()} to {returns.index[-1].date()})")
+    return returns
+
+
+# ─────────────────────────────────────────────
+# STEP 2: GROUND-TRUTH CALCULATIONS
+# These are the reference values the agents will be evaluated against.
+# ─────────────────────────────────────────────
+def compute_ground_truth(returns: pd.DataFrame,
+                         portfolio: dict[str, float]) -> dict:
+    """
+    Compute portfolio volatility and 95% Historical VaR directly in Python.
+    Used as ground truth for evaluating agent accuracy.
+    """
+    weights = np.array([portfolio[t] for t in returns.columns])
+
+    # Portfolio daily returns
+    port_returns = returns.values @ weights
+
+    # Annualized volatility
+    daily_vol  = port_returns.std()
+    annual_vol = daily_vol * np.sqrt(252)
+
+    # Historical VaR (parametric)
+    var_1d = -np.percentile(port_returns, (1 - VAR_CONFIDENCE) * 100)
+    var_10d = var_1d * np.sqrt(10)
+
+    # Sharpe ratio (assumes risk-free rate = 0 for simplicity)
+    sharpe = (port_returns.mean() * 252) / annual_vol
+
+    return {
+        "daily_volatility":       round(float(daily_vol), 6),
+        "annual_volatility":      round(float(annual_vol), 4),
+        "var_1d_95":              round(float(var_1d), 6),
+        "var_10d_95":             round(float(var_10d), 6),
+        "sharpe_ratio":           round(float(sharpe), 4),
+        "n_trading_days":         len(returns),
+        "portfolio":              portfolio,
+    }
+
+
+# ─────────────────────────────────────────────
+# STEP 3: SINGLE-AGENT BASELINE
+# ─────────────────────────────────────────────
+def run_single_agent(returns_csv: str, portfolio: dict) -> dict:
+    """
+    Single AssistantAgent with no validation step.
+    Returns the agent's parsed output and any errors detected.
+    """
+    analyst_only = autogen.AssistantAgent(
+        name="Single_Analyst",
+        llm_config=LLM_CONFIG,
+        system_message=(
+            "You are a financial risk analyst. You will be given portfolio weights "
+            "and a CSV of daily log returns. Calculate: (1) annualized portfolio volatility, "
+            "(2) 1-day 95% Historical VaR, (3) 10-day 95% VaR. "
+            "Respond ONLY with a JSON object with keys: "
+            "annual_volatility, var_1d_95, var_10d_95. No explanation, no code blocks."
+        ),
+    )
+
+    user_proxy = autogen.UserProxyAgent(
+        name="User",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=1,
+        code_execution_config=False,
+    )
+
+    prompt = (
+        f"Portfolio weights: {json.dumps(portfolio)}\n\n"
+        f"Daily log returns (CSV):\n{returns_csv}"
+    )
+
+    user_proxy.initiate_chat(analyst_only, message=prompt, silent=True)
+
+    # Extract the last assistant message
+    last_msg = analyst_only.last_message()["content"]
+    return _parse_agent_output(last_msg, agent_type="single")
+
+
+# ─────────────────────────────────────────────
+# STEP 4: MULTI-AGENT PIPELINE
+# Commander → Financial Analyst → Risk Safeguard
+# ─────────────────────────────────────────────
+def run_multi_agent(returns_csv: str, portfolio: dict) -> dict:
+    """
+    Three-agent pipeline:
+      Commander (UserProxy) → Financial Analyst → Risk Safeguard
+    The Safeguard reviews analyst output before it is accepted.
+    """
+    commander = autogen.UserProxyAgent(
+        name="Commander",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=5,
+        code_execution_config=False,
+    )
+
+    financial_analyst = autogen.AssistantAgent(
+        name="Financial_Analyst",
+        llm_config=LLM_CONFIG,
+        system_message=(
+            "You are a Financial Risk Analyst. Given portfolio weights and daily log returns, "
+            "calculate: (1) annualized portfolio volatility, (2) 1-day 95% Historical VaR, "
+            "(3) 10-day 95% VaR. "
+            "Respond ONLY with a JSON object with keys: "
+            "annual_volatility, var_1d_95, var_10d_95. No explanation, no code blocks."
+        ),
+    )
+
+    risk_safeguard = autogen.AssistantAgent(
+        name="Risk_Safeguard",
+        llm_config=LLM_CONFIG,
+        system_message=(
+            "You are a Risk Safeguard agent. You receive a JSON of financial risk metrics. "
+            "Check for: (1) values out of plausible range (annual vol < 0.5% or > 200%, "
+            "VaR negative or implausibly large), (2) missing or null fields, "
+            "(3) logical inconsistencies (10d VaR should be ~3.16x 1d VaR). "
+            "If the output is valid, reply exactly: APPROVED: {original_json}. "
+            "If invalid, reply: REJECTED: {explanation} and provide corrected values if possible."
+        ),
+    )
+
+    groupchat = autogen.GroupChat(
+        agents=[commander, financial_analyst, risk_safeguard],
+        messages=[],
+        max_round=6,
+        speaker_selection_method="round_robin",
+    )
+    manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=LLM_CONFIG)
+
+    prompt = (
+        f"Analyze the following portfolio.\n"
+        f"Portfolio weights: {json.dumps(portfolio)}\n\n"
+        f"Daily log returns (CSV):\n{returns_csv}\n\n"
+        "Financial_Analyst: compute the risk metrics. "
+        "Risk_Safeguard: validate the output."
+    )
+
+    commander.initiate_chat(manager, message=prompt, silent=True)
+
+    # Find the last APPROVED message from Risk_Safeguard
+    messages = groupchat.messages
+    approved_msg = None
+    for msg in reversed(messages):
+        if msg.get("name") == "Risk_Safeguard" and "APPROVED" in msg.get("content", ""):
+            approved_msg = msg["content"]
+            break
+
+    if approved_msg is None:
+        # Fall back to last Analyst message
+        for msg in reversed(messages):
+            if msg.get("name") == "Financial_Analyst":
+                approved_msg = msg.get("content", "")
+                break
+
+    return _parse_agent_output(approved_msg or "", agent_type="multi")
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def _parse_agent_output(text: str, agent_type: str) -> dict:
+    """Extract JSON values from agent response. Returns parsed dict + error flag."""
+    result = {
+        "agent_type":       agent_type,
+        "raw_output":       text,
+        "annual_volatility": None,
+        "var_1d_95":         None,
+        "var_10d_95":        None,
+        "parse_error":       False,
+    }
+    try:
+        # Strip APPROVED: prefix if present
+        clean = text.replace("APPROVED:", "").strip()
+        # Find first JSON block
+        start = clean.find("{")
+        end   = clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            raise ValueError("No JSON found in output")
+        parsed = json.loads(clean[start:end])
+        result["annual_volatility"] = float(parsed.get("annual_volatility", 0))
+        result["var_1d_95"]         = float(parsed.get("var_1d_95", 0))
+        result["var_10d_95"]        = float(parsed.get("var_10d_95", 0))
+    except Exception as e:
+        result["parse_error"] = True
+        result["error_msg"]   = str(e)
+    return result
+
+
+def compute_accuracy(agent_result: dict, ground_truth: dict) -> dict:
+    """Compute absolute percentage error for each metric."""
+    metrics = ["annual_volatility", "var_1d_95", "var_10d_95"]
+    errors  = {}
+    for m in metrics:
+        gt  = ground_truth.get(m)
+        est = agent_result.get(m)
+        if gt and est and gt != 0:
+            errors[m + "_pct_error"] = round(abs(est - gt) / abs(gt) * 100, 2)
+        else:
+            errors[m + "_pct_error"] = None
+    return errors
+
+
+# ─────────────────────────────────────────────
+# STEP 5: EVALUATION LOOP
+# ─────────────────────────────────────────────
+def run_evaluation(n_trials: int = 5,
+                   portfolio: dict = DEFAULT_PORTFOLIO) -> pd.DataFrame:
+    """
+    Run n_trials of both single-agent and multi-agent pipelines.
+    Returns a DataFrame summarizing accuracy across trials.
+    """
+    returns    = fetch_portfolio_data(portfolio)
+    truth      = compute_ground_truth(returns, portfolio)
+    returns_csv = returns.to_csv()
+
+    print(f"\nGround Truth:\n  Annual Vol : {truth['annual_volatility']:.2%}")
+    print(f"  1d VaR 95% : {truth['var_1d_95']:.4f}")
+    print(f"  10d VaR 95%: {truth['var_10d_95']:.4f}")
+
+    records = []
+
+    for trial in range(1, n_trials + 1):
+        print(f"\n── Trial {trial}/{n_trials} ──────────────────────────")
+
+        # Single-agent
+        print("  Running single-agent...")
+        t0     = time.time()
+        single = run_single_agent(returns_csv, portfolio)
+        single["elapsed_s"] = round(time.time() - t0, 1)
+        single.update(compute_accuracy(single, truth))
+        single["trial"] = trial
+        records.append(single)
+        print(f"  Single done  ({single['elapsed_s']}s) | parse_error={single['parse_error']}")
+
+        # Multi-agent
+        print("  Running multi-agent...")
+        t0    = time.time()
+        multi = run_multi_agent(returns_csv, portfolio)
+        multi["elapsed_s"] = round(time.time() - t0, 1)
+        multi.update(compute_accuracy(multi, truth))
+        multi["trial"] = trial
+        records.append(multi)
+        print(f"  Multi  done  ({multi['elapsed_s']}s) | parse_error={multi['parse_error']}")
+
+    df = pd.DataFrame(records)
+    df.to_csv(RESULTS_DIR / "evaluation_results.csv", index=False)
+    return df, truth
+
+
+# ─────────────────────────────────────────────
+# STEP 6: VISUALIZE EVALUATION
+# ─────────────────────────────────────────────
+def plot_evaluation(df: pd.DataFrame, truth: dict) -> None:
+    """Side-by-side accuracy comparison: single vs multi-agent."""
+    metrics      = ["annual_volatility_pct_error", "var_1d_95_pct_error", "var_10d_95_pct_error"]
+    metric_labels = ["Annual Volatility", "1d VaR (95%)", "10d VaR (95%)"]
+
+    single_df = df[df["agent_type"] == "single"]
+    multi_df  = df[df["agent_type"] == "multi"]
+
+    x    = np.arange(len(metrics))
+    w    = 0.35
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    single_means = [single_df[m].dropna().mean() for m in metrics]
+    multi_means  = [multi_df[m].dropna().mean()  for m in metrics]
+
+    ax.bar(x - w/2, single_means, w, label="Single Agent",
+           color="#E63946", alpha=0.85, edgecolor="white")
+    ax.bar(x + w/2, multi_means,  w, label="Multi-Agent (w/ Safeguard)",
+           color="#457B9D", alpha=0.85, edgecolor="white")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels, fontsize=11)
+    ax.set_ylabel("Mean Absolute % Error vs Ground Truth", fontsize=11)
+    ax.set_title("Single-Agent vs Multi-Agent Accuracy\n(Lower is Better)", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    fig.savefig(RESULTS_DIR / "agent_comparison.png", dpi=150)
+    plt.close(fig)
+
+    # Parse error rate
+    fig, ax = plt.subplots(figsize=(5, 4))
+    error_rates = [
+        single_df["parse_error"].mean() * 100,
+        multi_df["parse_error"].mean()  * 100,
+    ]
+    ax.bar(["Single Agent", "Multi-Agent"], error_rates,
+           color=["#E63946", "#457B9D"], alpha=0.85, edgecolor="white", width=0.4)
+    ax.set_ylabel("Parse Error Rate (%)", fontsize=11)
+    ax.set_title("Output Parse Error Rate by Agent Type", fontsize=12)
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    fig.savefig(RESULTS_DIR / "parse_error_rate.png", dpi=150)
+    plt.close(fig)
+
+    print(f"\nFigures saved to {RESULTS_DIR}/")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+def main():
+    print("=" * 55)
+    print("Multi-Agent LLM: Financial Risk Assessment")
+    print("=" * 55)
+
+    df, truth = run_evaluation(n_trials=5, portfolio=DEFAULT_PORTFOLIO)
+
+    print("\n── Summary ─────────────────────────────────────────────")
+    summary = (
+        df.groupby("agent_type")[
+            ["annual_volatility_pct_error", "var_1d_95_pct_error",
+             "var_10d_95_pct_error", "parse_error"]
+        ]
+        .mean()
+        .round(3)
+    )
+    print(summary.to_string())
+
+    plot_evaluation(df, truth)
+    print("\n✓ Evaluation complete.")
+
+
+if __name__ == "__main__":
+    main()
